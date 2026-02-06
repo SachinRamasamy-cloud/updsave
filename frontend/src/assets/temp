@@ -1,0 +1,734 @@
+import React, { useState, useRef, useEffect } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+    Play, Pause, Square, Trash2,
+    Upload, FileDown, Plus,
+    Search, Target, RefreshCcw,
+    ZoomIn, ZoomOut, Hand, MousePointer2, Move,
+    RotateCcw, Rewind, FastForward,
+    HelpCircle, FileVideo,
+    StepForward, StepBack,
+    Save // Added Save Icon
+} from "lucide-react";
+import { Stage, Layer, Rect, Transformer, Text } from "react-konva";
+
+const Editor = () => {
+    // --- STATE MANAGEMENT ---
+
+    // Video & Playback
+    const [videoFile, setVideoFile] = useState(null);
+    const [videoSrc, setVideoSrc] = useState(null);
+    const [isPlaying, setIsPlaying] = useState(false);
+    const [currentTime, setCurrentTime] = useState(0);
+    const [duration, setDuration] = useState(0);
+    const [fps, setFps] = useState(30);
+    const [totalFrames, setTotalFrames] = useState(0);
+    const [currentFrame, setCurrentFrame] = useState(0);
+    const [isSeeking, setIsSeeking] = useState(false); // Fix for smooth seeking
+
+    // Layout & Canvas
+    const [videoDimensions, setVideoDimensions] = useState({ width: 0, height: 0, scale: 1 });
+    const [zoom, setZoom] = useState(1);
+    const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
+    const [showHints, setShowHints] = useState(false);
+
+    // Tools & Mode
+    const [mode, setMode] = useState("draw"); // Options: 'draw', 'edit', 'pan'
+    const [selectedClass, setSelectedClass] = useState("Car");
+
+    // Annotation Data
+    const [annotations, setAnnotations] = useState([]);
+    const [selectedId, setSelectedId] = useState(null);
+    const [currentRect, setCurrentRect] = useState(null);
+    const [drawStartPos, setDrawStartPos] = useState({ x: 0, y: 0 });
+    const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+    const [classCounters, setClassCounters] = useState({});
+    const [goToFrame, setGoToFrame] = useState("");
+
+    // --- REFS ---
+    const videoRef = useRef(null);
+    const stageRef = useRef(null);
+    const transformerRef = useRef(null);
+    const fileInputRef = useRef(null);
+    const containerRef = useRef(null);
+    const fpsRef = useRef(fps);
+
+    // --- EFFECTS ---
+
+    // 1. Update FPS Ref
+    useEffect(() => {
+        fpsRef.current = fps;
+    }, [fps]);
+
+    // 2. Keyboard Shortcuts
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+            if (!videoRef.current || e.target.tagName === 'INPUT') return;
+
+            switch (e.code) {
+                case 'Space': e.preventDefault(); togglePlay(); break;
+                case 'ArrowLeft': e.preventDefault(); stepFrame(-1); break;
+                case 'ArrowRight': e.preventDefault(); stepFrame(1); break;
+                case 'Delete':
+                    if (selectedId) {
+                        setAnnotations(prev => prev.filter(a => a.id !== selectedId));
+                        setSelectedId(null);
+                        setMode('edit');
+                    }
+                    break;
+                default: break;
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [selectedId, fps]);
+
+    // 3. Attach Transformer
+    useEffect(() => {
+        if (selectedId && transformerRef.current && stageRef.current) {
+            const node = stageRef.current.findOne('.' + selectedId);
+            if (node) {
+                transformerRef.current.nodes([node]);
+                transformerRef.current.getLayer().batchDraw();
+            } else {
+                transformerRef.current.nodes([]);
+            }
+        } else if (transformerRef.current) {
+            transformerRef.current.nodes([]);
+        }
+    }, [selectedId, annotations, mode]);
+
+    // 4. Handle Resize
+    useEffect(() => {
+        const handleResize = () => {
+            if (videoRef.current && containerRef.current) updateVideoDimensions();
+        };
+        window.addEventListener('resize', handleResize);
+        return () => window.removeEventListener('resize', handleResize);
+    }, [videoSrc]);
+
+    // 5. Video Frame Callback
+    useEffect(() => {
+        const video = videoRef.current;
+        if (!video || !video.requestVideoFrameCallback) return;
+
+        let callbackId;
+        const onFrame = (now, metadata) => {
+            // Fix: Don't update state while user is dragging seek bar
+            if (!isSeeking) {
+                const frame = Math.round(metadata.mediaTime * fpsRef.current);
+                setCurrentFrame(frame);
+            }
+            callbackId = video.requestVideoFrameCallback(onFrame);
+        };
+
+        callbackId = video.requestVideoFrameCallback(onFrame);
+        return () => {
+            if (callbackId) video.cancelVideoFrameCallback(callbackId);
+        };
+    }, [videoSrc, fps, isSeeking]);
+
+    // --- HELPER FUNCTIONS ---
+
+    const updateVideoDimensions = () => {
+        if (!videoRef.current || !containerRef.current) return;
+        const video = videoRef.current;
+        const container = containerRef.current;
+
+        if (video.videoWidth) {
+            const containerRatio = container.offsetWidth / container.offsetHeight;
+            const videoRatio = video.videoWidth / video.videoHeight;
+            let finalWidth, finalHeight;
+
+            if (videoRatio > containerRatio) {
+                finalWidth = container.offsetWidth;
+                finalHeight = finalWidth / videoRatio;
+            } else {
+                finalHeight = container.offsetHeight;
+                finalWidth = finalHeight * videoRatio;
+            }
+
+            setVideoDimensions({
+                width: finalWidth,
+                height: finalHeight,
+                scale: video.videoWidth / finalWidth
+            });
+        }
+    };
+
+    // --- SAVE / LOAD DRAFT ---
+
+    const saveDraft = () => {
+        if (!videoFile) return;
+        const draftData = {
+            fileName: videoFile.name,
+            annotations,
+            classCounters,
+            fps,
+            totalFrames,
+            lastFrame: currentFrame
+        };
+        localStorage.setItem(`savetrax_draft_${videoFile.name}`, JSON.stringify(draftData));
+        alert("Draft saved to Local Storage!");
+    };
+
+    const loadDraft = (file) => {
+        const draft = localStorage.getItem(`savetrax_draft_${file.name}`);
+        if (draft) {
+            const data = JSON.parse(draft);
+            setAnnotations(data.annotations || []);
+            setClassCounters(data.classCounters || {});
+            if (data.fps) setFps(data.fps);
+            if (data.totalFrames) setTotalFrames(data.totalFrames);
+            console.log("Draft loaded for", file.name);
+            return true;
+        }
+        return false;
+    };
+
+    // --- PLAYBACK LOGIC ---
+
+    const handleFileUpload = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const url = URL.createObjectURL(file);
+        setVideoSrc(url);
+        setVideoFile(file);
+        
+        // Reset Logic
+        setAnnotations([]);
+        setClassCounters({});
+        resetZoom();
+
+        // 1. Check for Draft
+        const hasDraft = loadDraft(file);
+
+        // 2. Electron FPS Detection (Restored)
+        if (window.nativeVideo) {
+            try {
+                const info = await window.nativeVideo.getInfo(file.path);
+                setFps(info.fps);
+                setDuration(info.duration);
+                setTotalFrames(info.totalFrames);
+                console.log("Native info loaded:", info);
+            } catch (err) {
+                console.error("Native bridge error:", err);
+            }
+        }
+    };
+
+    const togglePlay = () => {
+        if (videoRef.current.paused) {
+            videoRef.current.play();
+            setIsPlaying(true);
+        } else {
+            videoRef.current.pause();
+            setIsPlaying(false);
+        }
+    };
+
+    const stepFrame = (framesToJump) => {
+        if (!videoRef.current) return;
+        videoRef.current.pause();
+        setIsPlaying(false);
+        const newTime = videoRef.current.currentTime + (framesToJump / fps);
+        videoRef.current.currentTime = Math.max(0, Math.min(newTime, duration));
+    };
+
+    const seekToFrameInput = () => {
+        const targetTime = parseInt(goToFrame) / fps;
+        if (!isNaN(targetTime)) {
+            videoRef.current.currentTime = targetTime;
+            setCurrentTime(targetTime);
+            videoRef.current.pause();
+            setIsPlaying(false);
+        }
+    };
+
+    // --- ZOOM & PAN (FIXED) ---
+
+    // Zero-Latency Video Sync
+    const handleDragMove = (e) => {
+        if (mode === 'pan' && videoRef.current) {
+            const x = e.target.x();
+            const y = e.target.y();
+            // Directly set style for performance
+            videoRef.current.style.transform = `translate(${x}px, ${y}px) scale(${zoom})`;
+        }
+    };
+
+    const handleDragEnd = (e) => {
+        // Sync React state after drag
+        setStagePos({ x: e.target.x(), y: e.target.y() });
+    };
+
+    // Custom Mouse Wheel Zoom
+    const handleWheel = (e) => {
+        e.evt.preventDefault();
+        const scaleBy = 1.1;
+        const stage = stageRef.current;
+        const oldScale = stage.scaleX();
+        const pointer = stage.getPointerPosition();
+
+        const mousePointTo = {
+            x: (pointer.x - stage.x()) / oldScale,
+            y: (pointer.y - stage.y()) / oldScale,
+        };
+
+        const newScale = e.evt.deltaY < 0 ? oldScale * scaleBy : oldScale / scaleBy;
+        const safeScale = Math.max(0.5, Math.min(newScale, 10));
+
+        const newPos = {
+            x: pointer.x - mousePointTo.x * safeScale,
+            y: pointer.y - mousePointTo.y * safeScale,
+        };
+
+        setZoom(safeScale);
+        setStagePos(newPos);
+
+        // Sync Video
+        if (videoRef.current) {
+            videoRef.current.style.transform = `translate(${newPos.x}px, ${newPos.y}px) scale(${safeScale})`;
+        }
+    };
+
+    const handleZoomButton = (direction) => {
+        const newScale = Math.max(0.5, Math.min(zoom * (direction > 0 ? 1.2 : 0.8), 10));
+        setZoom(newScale);
+        // Simple center zoom simulation for buttons
+        if (videoRef.current) {
+            videoRef.current.style.transform = `translate(${stagePos.x}px, ${stagePos.y}px) scale(${newScale})`;
+        }
+    };
+
+    const resetZoom = () => {
+        setZoom(1);
+        setStagePos({ x: 0, y: 0 });
+        if (videoRef.current) {
+            videoRef.current.style.transform = `translate(0px, 0px) scale(1)`;
+        }
+    };
+
+    const selectiveZoom = (ann) => {
+        videoRef.current.pause();
+        setIsPlaying(false);
+        videoRef.current.currentTime = parseFloat(ann.timestamp);
+
+        const targetZoom = 3;
+        const objCenterX = ann.x + (ann.width / 2);
+        const objCenterY = ann.y + (ann.height / 2);
+        const viewportCenterX = videoDimensions.width / 2;
+        const viewportCenterY = videoDimensions.height / 2;
+
+        const newPos = {
+            x: viewportCenterX - (objCenterX * targetZoom),
+            y: viewportCenterY - (objCenterY * targetZoom)
+        };
+
+        setZoom(targetZoom);
+        setStagePos(newPos);
+
+        if (videoRef.current) {
+            videoRef.current.style.transform = `translate(${newPos.x}px, ${newPos.y}px) scale(${targetZoom})`;
+        }
+
+        setSelectedId(ann.id);
+        setMode('edit');
+    };
+
+    // --- DRAWING LOGIC ---
+
+    const getRelativePointerPosition = (stage) => {
+        const transform = stage.getAbsoluteTransform().copy().invert();
+        return transform.point(stage.getPointerPosition());
+    };
+
+    const handleMouseDown = (e) => {
+        if (mode === 'pan') return;
+
+        const stage = e.target.getStage();
+        const pos = getRelativePointerPosition(stage);
+
+        if (e.target === stage) {
+            if (mode === "draw") {
+                setSelectedId(null);
+                const id = `shape-${Date.now()}`;
+                setDrawStartPos({ x: pos.x, y: pos.y });
+                setCurrentRect({ x: pos.x, y: pos.y, width: 0, height: 0, id });
+            } else if (mode === "edit") {
+                setSelectedId(null);
+            }
+        }
+    };
+
+    const handleMouseMove = (e) => {
+        if (mode === 'pan') return;
+
+        const stage = e.target.getStage();
+        const pos = getRelativePointerPosition(stage);
+        setMousePos(pos);
+
+        if (!currentRect || mode !== "draw") return;
+
+        const newX = Math.min(drawStartPos.x, pos.x);
+        const newY = Math.min(drawStartPos.y, pos.y);
+        const newWidth = Math.abs(pos.x - drawStartPos.x);
+        const newHeight = Math.abs(pos.y - drawStartPos.y);
+
+        setCurrentRect({ ...currentRect, x: newX, y: newY, width: newWidth, height: newHeight });
+    };
+
+    const handleMouseUp = () => {
+        if (mode === "draw" && currentRect) {
+            if (currentRect.width > 5 && currentRect.height > 5) {
+                addAnnotation(currentRect);
+            } else {
+                setCurrentRect(null);
+            }
+        }
+    };
+
+    const addAnnotation = (rect) => {
+        const currentCount = (classCounters[selectedClass] || 0) + 1;
+        const newEntry = {
+            ...rect,
+            label: `${selectedClass}_${currentCount}`,
+            frame: currentFrame,
+            timestamp: currentTime.toFixed(3),
+            id: rect.id
+        };
+
+        setAnnotations([...annotations, newEntry]);
+        setClassCounters({ ...classCounters, [selectedClass]: currentCount });
+        setCurrentRect(null);
+        setSelectedId(newEntry.id);
+        setMode("edit");
+    };
+
+    const exportCSV = () => {
+        const headers = "Label,Frame,Timestamp,X,Y,Width,Height\n";
+        const scale = videoDimensions.scale;
+        const rows = annotations.map(ann =>
+            `${ann.label},${ann.frame},${ann.timestamp},${Math.round(ann.x * scale)},${Math.round(ann.y * scale)},${Math.round(ann.width * scale)},${Math.round(ann.height * scale)}`
+        ).join("\n");
+        const blob = new Blob([headers + rows], { type: 'text/csv' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `annotations_${Date.now()}.csv`;
+        a.click();
+    };
+
+    // --- UI HELPER ---
+    const Hint = ({ text }) => showHints ? (
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="absolute -top-10 left-1/2 -translate-x-1/2 bg-indigo-600 text-white text-[10px] px-2 py-1 rounded shadow-lg whitespace-nowrap z-50 border border-white/20">
+            {text} <div className="absolute bottom-[-4px] left-1/2 -translate-x-1/2 w-2 h-2 bg-indigo-600 rotate-45"></div>
+        </motion.div>
+    ) : null;
+
+    return (
+        <div className="flex flex-col h-screen w-full bg-[#09090b] text-slate-300 overflow-hidden font-sans select-none">
+
+            {/* --- HEADER --- */}
+            <div className="h-14 bg-[#111114] border-b border-white/5 flex items-center px-6 justify-between z-30">
+                <div className="flex items-center gap-4">
+                    <h1 className="text-lg font-black text-white tracking-tight">SAVETRAX <span className="text-indigo-500"> - </span>2.0</h1>
+                    <div className="h-6 w-[1px] bg-white/10 mx-2"></div>
+                    <div className="flex items-center gap-2 text-[11px] font-mono bg-black/40 px-3 py-1.5 rounded-full border border-white/5">
+                        <span className="text-slate-500">FPS:</span>
+                        <input type="number" className="bg-transparent w-8 text-white outline-none font-bold" value={fps} readOnly />
+                    </div>
+                </div>
+
+                <div className="flex items-center gap-4">
+                    {/* SAVE DRAFT BUTTON */}
+                    <button onClick={saveDraft} className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-[11px] font-bold transition-all shadow-lg shadow-blue-900/50">
+                        <Save size={14} /> SAVE DRAFT
+                    </button>
+
+                    <div className="h-6 w-[1px] bg-white/10"></div>
+
+                    <button onClick={() => setShowHints(!showHints)} className={`flex items-center gap-2 px-3 py-1.5 rounded text-[11px] font-bold transition-all ${showHints ? 'bg-indigo-600 text-white' : 'bg-white/5 text-slate-400 hover:text-white'}`}>
+                        <HelpCircle size={14} /> {showHints ? 'HINTS ON' : 'HELP'}
+                    </button>
+                    <div className="flex items-center gap-2 text-[10px] font-mono">
+                        <span className={`w-2 h-2 rounded-full ${videoSrc ? 'bg-emerald-500' : 'bg-red-500'}`}></span>
+                        <span>{videoSrc ? "SYSTEM READY" : "NO SOURCE"}</span>
+                    </div>
+                </div>
+            </div>
+
+            <div className="flex flex-1 overflow-hidden">
+                {/* --- MAIN CANVAS AREA --- */}
+                <main className="flex-1 flex flex-col relative bg-[#050507]">
+
+                    {/* OVERLAYS */}
+                    <div className="absolute top-4 left-6 z-20 pointer-events-none">
+                        <div className="bg-black/90 backdrop-blur-md px-4 py-2 rounded-lg border border-white/10 shadow-xl">
+                            <span className="text-[9px] text-indigo-400 font-bold block mb-1 opacity-70">CANVAS POSITION</span>
+                            <span className="text-sm font-mono text-white tracking-widest">X:{Math.round(mousePos.x)} Y:{Math.round(mousePos.y)}</span>
+                        </div>
+                    </div>
+
+                    <div className="absolute top-4 right-6 z-20 flex flex-col items-end gap-3">
+                        <div className="bg-black/90 backdrop-blur-md px-4 py-2 rounded-lg border border-white/10 shadow-xl text-right">
+                            <span className="text-[9px] text-emerald-400 font-bold block mb-1 opacity-70">FRAMES</span>
+                            <div className="text-sm font-mono text-white tracking-widest">
+                                <span className="text-white">{currentFrame}</span>
+                                <span className="text-slate-600 mx-1">/</span>
+                                <span className="text-slate-400">{totalFrames}</span>
+                            </div>
+                        </div>
+                        <div className="bg-black/90 backdrop-blur-md p-1.5 rounded-lg border border-white/10 shadow-xl flex flex-col gap-1">
+                            <button onClick={() => handleZoomButton(1)} className="p-2 hover:bg-white/10 rounded text-indigo-400"><ZoomIn size={18} /></button>
+                            <button onClick={() => handleZoomButton(-1)} className="p-2 hover:bg-white/10 rounded text-slate-400"><ZoomOut size={18} /></button>
+                            <button onClick={resetZoom} className="p-2 hover:bg-white/10 rounded text-slate-400"><RefreshCcw size={16} /></button>
+                        </div>
+                    </div>
+
+                    {/* VIDEO CONTAINER - overflow-hidden is CRITICAL for fix */}
+                    <div ref={containerRef} className="flex-1 relative flex items-center justify-center overflow-hidden bg-black/20">
+                        {videoSrc ? (
+                            <div style={{ width: videoDimensions.width, height: videoDimensions.height, position: 'relative' }}>
+                                {/* VIDEO ELEMENT WITH ABSOLUTE POSITIONING AND TRANSFORM */}
+                                <video
+                                    ref={videoRef}
+                                    src={videoSrc}
+                                    onTimeUpdate={() => {
+                                        if(!isSeeking) setCurrentTime(videoRef.current.currentTime);
+                                    }}
+                                    onLoadedMetadata={(e) => { setDuration(e.target.duration); updateVideoDimensions(); }}
+                                    className="absolute top-0 left-0 w-full h-full object-contain pointer-events-none origin-top-left will-change-transform"
+                                    style={{
+                                        transform: `translate(${stagePos.x}px, ${stagePos.y}px) scale(${zoom})`
+                                    }}
+                                />
+                                <Stage
+                                    width={videoDimensions.width}
+                                    height={videoDimensions.height}
+                                    scaleX={zoom}
+                                    scaleY={zoom}
+                                    x={stagePos.x}
+                                    y={stagePos.y}
+                                    draggable={mode === 'pan'}
+                                    onDragMove={handleDragMove} // SYNC VIDEO WITH PAN
+                                    onDragEnd={handleDragEnd}
+                                    className={`absolute top-0 left-0 ${mode === 'pan' ? 'cursor-grab active:cursor-grabbing' : mode === 'draw' ? 'cursor-crosshair' : 'cursor-default'}`}
+                                    onMouseDown={handleMouseDown}
+                                    onMouseMove={handleMouseMove}
+                                    onMouseUp={handleMouseUp}
+                                    onWheel={handleWheel} // MOUSE WHEEL ZOOM
+                                    ref={stageRef}
+                                >
+                                    <Layer>
+                                        {annotations.filter(a => Math.abs(a.timestamp - currentTime) < (1 / fps)).map((ann) => (
+                                            <React.Fragment key={ann.id}>
+                                                <Text
+                                                    text={ann.label}
+                                                    x={ann.x}
+                                                    y={ann.y - 18 / zoom}
+                                                    fontSize={14 / zoom}
+                                                    fill="#e5e7eb"
+                                                    padding={4 / zoom}
+                                                    background="#111827"
+                                                    listening={false}
+                                                />
+                                                <Rect
+                                                    {...ann}
+                                                    name={ann.id}
+                                                    draggable={mode === 'edit' && selectedId === ann.id}
+                                                    onClick={() => { setSelectedId(ann.id); setMode('edit'); }}
+                                                    onTap={() => { setSelectedId(ann.id); setMode('edit'); }}
+                                                    onDragEnd={(e) => {
+                                                        const node = e.target;
+                                                        setAnnotations(annotations.map(a => a.id === ann.id ? { ...a, x: node.x(), y: node.y() } : a));
+                                                    }}
+                                                    onTransformEnd={(e) => {
+                                                        const node = e.target;
+                                                        setAnnotations(annotations.map(a => a.id === ann.id ? {
+                                                            ...a, x: node.x(), y: node.y(), width: node.width() * node.scaleX(), height: node.height() * node.scaleY()
+                                                        } : a));
+                                                        node.scaleX(1); node.scaleY(1);
+                                                    }}
+                                                    stroke={selectedId === ann.id ? "#f43f5e" : "#818cf8"}
+                                                    strokeWidth={selectedId === ann.id ? 2 / zoom : 1.5 / zoom}
+                                                    fill={selectedId === ann.id ? "rgba(244, 63, 94, 0.1)" : "transparent"}
+                                                />
+                                            </React.Fragment>
+                                        ))}
+                                        {currentRect && (
+                                            <Rect {...currentRect} stroke="#34d399" strokeWidth={2 / zoom} dash={[4, 2]} />
+                                        )}
+                                        <Transformer
+                                            ref={transformerRef}
+                                            rotateEnabled={false}
+                                            borderStroke="#f43f5e"
+                                            anchorStroke="#f43f5e"
+                                            anchorSize={8}
+                                            anchorCornerRadius={2}
+                                            boundBoxFunc={(oldBox, newBox) => (newBox.width < 5 || newBox.height < 5) ? oldBox : newBox}
+                                        />
+                                    </Layer>
+                                </Stage>
+                            </div>
+                        ) : (
+                            <div className="text-center opacity-30 select-none">
+                                <FileVideo size={80} className="mx-auto mb-4" />
+                                <p className="text-2xl font-black tracking-tighter">DRAG & DROP VIDEO</p>
+                            </div>
+                        )}
+                    </div>
+                </main>
+
+                {/* --- SIDEBAR --- */}
+                <aside className="w-80 bg-[#0e0e11] border-l border-white/5 flex flex-col z-30">
+                    <div className="p-4 border-b border-white/5 flex items-center justify-between bg-[#131316]">
+                        <h2 className="text-[10px] font-black tracking-[0.2em] text-slate-500 uppercase">Detection List</h2>
+                        <span className="bg-white/10 text-white text-[10px] px-2 py-0.5 rounded font-mono">{annotations.length}</span>
+                    </div>
+
+                    <div className="flex-1 overflow-y-auto p-2 space-y-2 custom-scrollbar">
+                        <AnimatePresence>
+                            {annotations.map((ann) => (
+                                <motion.div
+                                    key={ann.id}
+                                    initial={{ opacity: 0, x: 20 }}
+                                    animate={{ opacity: 1, x: 0 }}
+                                    exit={{ opacity: 0, x: -20 }}
+                                    className={`p-3 rounded border transition-all relative ${selectedId === ann.id ? 'bg-indigo-500/10 border-indigo-500' : 'bg-[#18181b] border-white/5 hover:border-white/20'}`}
+                                >
+                                    <div className="flex justify-between items-start mb-2 cursor-pointer" onClick={() => selectiveZoom(ann)}>
+                                        <div>
+                                            <h4 className="text-[11px] font-bold text-white tracking-tight flex items-center gap-2">
+                                                <Square size={10} className={selectedId === ann.id ? "text-indigo-400" : "text-slate-500"} />
+                                                {ann.label}
+                                            </h4>
+                                            <div className="mt-1 space-y-0.5">
+                                                <div className="text-[9px] text-slate-500 font-mono">
+                                                    FRAME: <span className="text-slate-300">{ann.frame}</span> | TIME: <span className="text-slate-300">{parseFloat(ann.timestamp).toFixed(2)}s</span>
+                                                </div>
+                                                <div className="text-[9px] text-slate-500 font-mono">
+                                                    POS: X:<span className="text-slate-300">{Math.round(ann.x)}</span> Y:<span className="text-slate-300">{Math.round(ann.y)}</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <button onClick={() => {
+                                        setAnnotations(annotations.filter(a => a.id !== ann.id));
+                                        if (selectedId === ann.id) setSelectedId(null);
+                                    }} className="absolute top-3 right-3 text-slate-600 hover:text-rose-500 transition-colors">
+                                        <Trash2 size={12} />
+                                    </button>
+                                </motion.div>
+                            ))}
+                        </AnimatePresence>
+                    </div>
+
+                    <div className="p-4 border-t border-white/5 space-y-3">
+                        <button
+                            onClick={() => { setMode('draw'); setSelectedId(null); }}
+                            className={`w-full py-3 rounded text-[10px] font-black tracking-widest flex items-center justify-center gap-2 transition-all ${mode === 'draw' ? 'bg-indigo-600 text-white shadow-lg shadow-emerald-900/50' : 'bg-white/5 text-slate-400 hover:bg-white/10'}`}
+                        >
+                            <Plus size={14} /> {mode === 'draw' ? 'DRAW MODE ACTIVE' : 'ADD ANNOTATION'}
+                        </button>
+                    </div>
+                </aside>
+            </div>
+
+            {/* --- FOOTER --- */}
+            <footer className="bg-[#111114] border-t border-white/5 p-4 z-40">
+                <div className="max-w-[1800px] mx-auto space-y-4">
+
+                    {/* TIMELINE */}
+                    <div className="flex items-center gap-4 group">
+                        <div className="text-[10px] font-mono text-slate-500 w-12 text-right">{currentTime.toFixed(2)}s</div>
+                        <div className="flex-1 relative h-6 flex items-center">
+                            <input
+                                type="range"
+                                min="0" max={duration || 0} step="0.01"
+                                value={currentTime}
+                                onMouseDown={() => setIsSeeking(true)} // SMOOTH SEEK START
+                                onMouseUp={() => setIsSeeking(false)}   // SMOOTH SEEK END
+                                onChange={(e) => {
+                                    const val = parseFloat(e.target.value);
+                                    setCurrentTime(val); // Instant UI update
+                                    videoRef.current.currentTime = val;
+                                }}
+                                className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-indigo-400 focus:outline-none z-10"
+                            />
+                            {annotations.map((ann, i) => (
+                                <div key={i} className="absolute h-2 w-[2px] bg-indigo-500/50 top-2 pointer-events-none" style={{ left: `${(parseFloat(ann.timestamp) / duration) * 100}%` }} />
+                            ))}
+                        </div>
+                        <div className="text-[10px] font-mono text-slate-500 w-12">{duration.toFixed(2)}s</div>
+                    </div>
+
+                    {/* CONTROL BAR */}
+                    <div className="flex items-center justify-between">
+
+                        <div className="flex items-center gap-6 relative">
+                            <Hint text="Playback Controls" />
+                            <div className="flex items-center gap-1 bg-black/40 p-1 rounded-full border border-white/5">
+                                <button onClick={() => { videoRef.current.currentTime = 0; setIsPlaying(false); }} className="p-2 text-slate-400 hover:text-white" title="Restart"><Square size={14} /></button>
+                                <div className="w-[1px] h-4 bg-white/10 mx-1"></div>
+                                <button onClick={() => stepFrame(-10)} className="p-2 text-slate-400 hover:text-white text-[10px] font-bold w-8"><Rewind size={14} /></button>
+                                <button onClick={() => stepFrame(-1)} className="p-2 text-slate-400 hover:text-white text-[10px] font-bold w-8"><StepBack size={14} /></button>
+                                <button onClick={togglePlay} className="w-10 h-10 rounded-full flex items-center justify-center text-white bg-indigo-600 transition-all shadow-lg hover:bg-indigo-500">
+                                    {isPlaying ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" className="ml-0.5" />}
+                                </button>
+                                <button onClick={() => stepFrame(1)} className="p-2 text-slate-400 hover:text-white text-[10px] font-bold w-8"><StepForward size={14} /></button>
+                                <button onClick={() => stepFrame(10)} className="p-2 text-slate-400 hover:text-white text-[10px] font-bold w-8"><FastForward size={14} /></button>
+                            </div>
+                            <div className="relative">
+                                <button onClick={() => fileInputRef.current.click()} className="px-4 py-2 bg-white/5 hover:bg-white/10 rounded text-[10px] font-bold flex items-center gap-2 transition-colors border border-white/5">
+                                    <Upload size={14} /> Upload
+                                </button>
+                                <Hint text="Load Local Video" />
+                                <input type="file" ref={fileInputRef} hidden accept="video/*" onChange={handleFileUpload} />
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-4 bg-black/40 px-4 py-2 rounded-lg border border-white/5 relative">
+                            <Hint text="Interaction Modes" />
+                            <div className="flex gap-1 bg-black/50 p-1 rounded border border-white/5">
+                                <button onClick={() => setMode('pan')} className={`p-1.5 rounded transition-all ${mode === 'pan' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:text-white'}`} title="Pan (H)"><Hand size={16} /></button>
+                                <button onClick={() => { setMode('draw'); setSelectedId(null); }} className={`p-1.5 rounded transition-all ${mode === 'draw' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:text-white'}`} title="Draw (D)"><Plus size={16} /></button>
+                                <button onClick={() => setMode('edit')} className={`p-1.5 rounded transition-all ${mode === 'edit' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:text-white'}`} title="Edit (V)"><MousePointer2 size={16} /></button>
+                            </div>
+                            <div className="w-[1px] h-6 bg-white/10" />
+                            <div className="flex flex-col relative">
+                                <label className="text-[8px] font-bold text-slate-500 uppercase mb-0.5">Label Class</label>
+                                <select value={selectedClass} onChange={(e) => setSelectedClass(e.target.value)} className="bg-transparent text-[11px] font-bold text-white outline-none w-24">
+                                    <option className="bg-[#111]">Auto</option>
+                                    <option className="bg-[#111]">Bike</option>
+                                    <option className="bg-[#111]">Bus</option>
+                                    <option className="bg-[#111]">Car</option>
+                                    <option className="bg-[#111]">LCV</option>
+                                    <option className="bg-[#111]">Truck</option>
+                                    <option className="bg-[#111]">NMV</option>
+                                    <option className="bg-[#111]">MultiAxle</option>
+                                    <option className="bg-[#111]">Pedestrian</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-3 relative">
+                            <Hint text="Jump to Frame / Export" />
+                            <div className="flex items-center gap-2 bg-black/40 px-3 py-1.5 rounded border border-white/5">
+                                <Target size={12} className="text-slate-500" />
+                                <input type="text" placeholder="FRAME" value={goToFrame} onChange={(e) => setGoToFrame(e.target.value)} className="bg-transparent text-[11px] w-12 text-white outline-none font-mono" />
+                                <button onClick={seekToFrameInput} className="text-indigo-400 hover:text-white"><Search size={14} /></button>
+                            </div>
+                            <button onClick={exportCSV} className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded text-[10px] font-bold hover:bg-emerald-500 transition-all shadow-lg shadow-emerald-900/50">
+                                <FileDown size={14} /> EXPORT CSV
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </footer>
+        </div>
+    );
+};
+
+export default Editor;
